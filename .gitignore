@@ -1,4 +1,4 @@
-# Ignore Python cache and virtual environments
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -8,32 +8,16 @@ venv/
 .venv/
 .inspect_deps/
 
-# Ignore backend models and data
-backend/astrodash_models/*
-backend/astrodash/*
-backend/dev_tests/astroset/training_set/*
-prod_backend/app/astrodash_models/*
-data/*
-prod_backend/test.db
-astrodash
-#Ignore testing files
-batch_upload.zip
+# Local data and bulky clones (not versioned)
+data/
+WiserepData/Perceiver-diffusion-autoencoder/
+WiserepData/Test/
 zmodel_training/Perceiver-diffusion-autoencoder/
 
-WiserepData/Perceiver-diffusion-autoencoder/
-WiserepData/Test
-
-prod_backend/data/*
-data/*
-astrodash_old/
-test_set/
-
-# Ignore OS files
+# OS / editor
 .DS_Store
 Thumbs.db
-
-# Ignore logs
-*.log
-.env
 .cursor/
 .vscode/
+.env
+*.log
