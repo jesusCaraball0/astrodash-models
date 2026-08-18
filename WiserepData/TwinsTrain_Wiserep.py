@@ -17,7 +17,7 @@ _PROJECT_ROOT = _WISEREP_DIR.parent
 TEST_ROOT = _WISEREP_DIR / "Test"
 HENNA_ROOT = _PROJECT_ROOT / "data" / "wiserep_henna"
 USE_REDSHIFT_CORRECTED_DATA = True
-DATA_DIR = HENNA_ROOT / ("deredshifted" if USE_REDSHIFT_CORRECTED_DATA else "Noderedshift")
+DATA_DIR = HENNA_ROOT / ("deredshifted" if USE_REDSHIFT_CORRECTED_DATA else "noderedshift")
 
 
 class WiserepDataset(Dataset):

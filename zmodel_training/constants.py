@@ -38,7 +38,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Henna deduplicated bundles (create_henna_matched_dash_split.py)
 WISEREP_HENNA_Z = PROJECT_ROOT / "data" / "wiserep_henna" / "deredshifted"
-WISEREP_HENNA_NOZ = PROJECT_ROOT / "data" / "wiserep_henna" / "Noderedshift"
+WISEREP_HENNA_NOZ = PROJECT_ROOT / "data" / "wiserep_henna" / "noderedshift"
 PROCESSED_META_HENNA_Z = WISEREP_HENNA_Z / "wiserep_metadata_processed.csv"
 PROCESSED_META_HENNA_NOZ = WISEREP_HENNA_NOZ / "wiserep_metadata_processed.csv"
 SPLITS_JSON_HENNA_MATCHED_Z = WISEREP_DIR / "henna_matched_split_z.json"

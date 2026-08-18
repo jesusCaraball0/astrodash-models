@@ -8,7 +8,7 @@ Embedding-quality artifacts: linear probe table, cosine kNN acc/purity, delta CM
 Usage:
   PYTHONPATH=WiserepData python WiserepData/latent_embedding_quality.py
   PYTHONPATH=WiserepData python WiserepData/latent_embedding_quality.py \\
-    --sources original,1024d2,five_try,six_try --k 15
+    --sources original,1024d2,try_5,try_6 --k 15
 """
 
 from __future__ import annotations
@@ -49,27 +49,39 @@ from latent_plots import (  # noqa: E402
     discover_run_dirs,
 )
 
-TRY_NAMES = ("second_try", "third_try", "four_try", "five_try", "six_try")
+TRY_NAMES = ("try_2", "try_3", "try_4", "try_5", "try_6")
+TRY_ALIASES = {
+    "second_try": "try_2",
+    "third_try": "try_3",
+    "four_try": "try_4",
+    "five_try": "try_5",
+    "five_try_noz": "try_5_noz",
+    "six_try": "try_6",
+    "six_try_noz": "try_6_noz",
+}
 TRY_TITLE = {
-    "second_try": "_2",
-    "third_try": "_3",
-    "four_try": "_4",
-    "five_try": "_5",
-    "six_try": "_6",
+    "try_2": "_2",
+    "try_3": "_3",
+    "try_4": "_4",
+    "try_5": "_5",
+    "try_6": "_6",
 }
 PREFERRED_SPLIT_SEEDS = (36, 73, 149, 257)
 
 TWINSANITY_LATENT_DIR = WISEREP_DIR / "Test" / "twinsanity_latents_40867"
 
 # Ensemble roots for MLP delta-CM / optional MLP columns.
+_LATENT_MODELS = (
+    _PROJECT_ROOT / "data" / "pre_trained_models" / "daep_latent"
+)
 ENSEMBLE_SPECS: list[tuple[str, str, pathlib.Path, str]] = [
     ("original", "Original", WISEREP_DIR / "Test" / "daep_comparison_legacy_unique", "legacy"),
     ("1024d2", "1024d2", WISEREP_DIR / "Test" / "daep_comparison", "underscore"),
-    ("second_try", "_2", WISEREP_DIR / "Test" / "daep_comparison_second_try", "split"),
-    ("third_try", "_3", WISEREP_DIR / "Test" / "daep_comparison_third_try", "split"),
-    ("four_try", "_4", WISEREP_DIR / "Test" / "daep_comparison_four_try", "split"),
-    ("five_try", "_5", WISEREP_DIR / "Test" / "daep_comparison_five_try", "split"),
-    ("six_try", "_6", WISEREP_DIR / "Test" / "daep_comparison_six_try", "split"),
+    ("try_2", "_2", _LATENT_MODELS / "try_2", "split"),
+    ("try_3", "_3", _LATENT_MODELS / "try_3", "split"),
+    ("try_4", "_4", _LATENT_MODELS / "try_4", "split"),
+    ("try_5", "_5", _LATENT_MODELS / "try_5", "split"),
+    ("try_6", "_6", _LATENT_MODELS / "try_6", "split"),
 ]
 
 
@@ -86,19 +98,33 @@ class SourceBundle:
 
 
 def _try_title(key: str) -> str:
-    return TRY_TITLE.get(key, key)
+    if key in TRY_TITLE:
+        return TRY_TITLE[key]
+    m = re.fullmatch(r"try_(\d+)(?:_noz)?", key)
+    if m:
+        return f"_{m.group(1)}"
+    return key
+
+
+def _normalize_source_key(key: str) -> str:
+    key = key.strip().lower().replace("-", "_")
+    return TRY_ALIASES.get(key, key)
+
+
+def _is_try_key(key: str) -> bool:
+    return key in TRY_NAMES or key.startswith("try_")
 
 
 def _pick_try_subdir(try_root: pathlib.Path, prefer_seed: int) -> pathlib.Path:
     subdirs = [p for p in sorted(try_root.iterdir()) if p.is_dir()]
     seed_order = (prefer_seed, *[s for s in PREFERRED_SPLIT_SEEDS if s != prefer_seed])
     for seed in seed_order:
-        pat = re.compile(rf"^Dered{seed}(_\d+)?$", re.IGNORECASE)
+        pat = re.compile(rf"^(Dered|Nodered){seed}(_\d+)?$", re.IGNORECASE)
         for p in subdirs:
             if pat.fullmatch(p.name):
                 return p
     for p in subdirs:
-        if p.name.lower().startswith("dered"):
+        if p.name.lower().startswith(("dered", "nodered")):
             return p
     for p in subdirs:
         try:
@@ -130,7 +156,7 @@ def resolve_latent_source(
     prefer_seed: int,
     original_dir: pathlib.Path,
 ) -> SourceBundle:
-    key = key.strip().lower().replace("-", "_")
+    key = _normalize_source_key(key)
     if key in ("original", "twinsanity", "legacy"):
         latent_dir = original_dir.resolve()
         meta, z, latent_npz, _ = load_latent_and_meta(latent_dir)
@@ -148,7 +174,7 @@ def resolve_latent_source(
         tr, va, te = split_and_filter(meta, train_idx=tr, val_idx=va, test_idx=te, split_tag=src)
         return SourceBundle("1024d2", "1024d2", z, meta, tr, va, te, latent_npz)
 
-    if key in TRY_NAMES or key.endswith("_try"):
+    if _is_try_key(key):
         sub = _pick_try_subdir(henna_root / key, prefer_seed).resolve()
         meta, z, latent_npz, _ = load_latent_and_meta(sub)
         tr, va, te, src = load_assignment_indices_from_dir(sub, meta)
@@ -506,7 +532,7 @@ def main() -> None:
         "--sources",
         type=str,
         default=None,
-        help="Comma-separated: original,1024d2,second_try,...,six_try",
+        help="Comma-separated: original,1024d2,try_2,...,try_6 (old five_try names still work)",
     )
     parser.add_argument("--prefer-seed", type=int, default=36)
     parser.add_argument("--henna-root", type=pathlib.Path, default=HENNA_ROOT)
@@ -532,7 +558,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     source_keys = (
-        [s.strip() for s in args.sources.split(",") if s.strip()]
+        [_normalize_source_key(s) for s in args.sources.split(",") if s.strip()]
         if args.sources
         else default_sources()
     )

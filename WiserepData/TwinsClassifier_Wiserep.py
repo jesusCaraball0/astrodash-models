@@ -37,7 +37,7 @@ DAEP_CFG_JSON = TEST_ROOT / "cfg_used.json"
 
 
 def data_dir_for(use_redshift: bool) -> pathlib.Path:
-    return HENNA_ROOT / ("deredshifted" if use_redshift else "Noderedshift")
+    return HENNA_ROOT / ("deredshifted" if use_redshift else "noderedshift")
 
 
 def out_dir_for(use_redshift: bool, iter_idx: int) -> pathlib.Path:

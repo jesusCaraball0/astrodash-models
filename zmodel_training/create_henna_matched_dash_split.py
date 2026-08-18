@@ -3,7 +3,7 @@
 Build Dash 1D CNN train/val/test JSON from Henna's deduplicated WISeREP meta.
 
 Pipeline:
-  1. Load data/wiserep_henna/{deredshifted|Noderedshift}/meta.csv (already deduped)
+  1. Load data/wiserep_henna/{deredshifted|noderedshift}/meta.csv (already deduped)
   2. Join spec_id -> Ascii file via data/wiserep/wiserep_metadata.csv
   3. Write wiserep_metadata_processed.csv (DASH/DAEP column names) next to meta.csv
   4. IAU-level 80/10/10 split (seed 0), keep mappable 5-class labels
@@ -301,7 +301,7 @@ def main() -> None:
     if args.variant in ("noz", "both"):
         jobs.append(
             (
-                "henna Noderedshift (observed frame)",
+                "henna noderedshift (observed frame)",
                 const.WISEREP_HENNA_NOZ / "meta.csv",
                 const.SPLITS_JSON_HENNA_MATCHED_NOZ,
                 const.PROCESSED_META_HENNA_NOZ,

@@ -10,7 +10,7 @@ Usage:
 
   PYTHONPATH=WiserepData NUMBA_CACHE_DIR=/tmp/numba_cache \\
     python WiserepData/latent_umap_compare.py \\
-      --sources original,five_try,six_try \\
+      --sources original,try_5,try_6 \\
       --max-points 10000 \\
       --out-dir WiserepData/Test/plots/latent_umap
 
@@ -52,13 +52,22 @@ from train_latent import (  # noqa: E402
 )
 from TwinsClassifier_Wiserep import CLASS_NAMES, row_class_idx  # noqa: E402
 
-TRY_NAMES = ("second_try", "third_try", "four_try", "five_try", "six_try")
+TRY_NAMES = ("try_2", "try_3", "try_4", "try_5", "try_6")
+TRY_ALIASES = {
+    "second_try": "try_2",
+    "third_try": "try_3",
+    "four_try": "try_4",
+    "five_try": "try_5",
+    "five_try_noz": "try_5_noz",
+    "six_try": "try_6",
+    "six_try_noz": "try_6_noz",
+}
 TRY_TITLE = {
-    "second_try": "_2",
-    "third_try": "_3",
-    "four_try": "_4",
-    "five_try": "_5",
-    "six_try": "_6",
+    "try_2": "_2",
+    "try_3": "_3",
+    "try_4": "_4",
+    "try_5": "_5",
+    "try_6": "_6",
 }
 PREFERRED_SPLIT_SEEDS = (36, 73, 149, 257)
 
@@ -127,6 +136,9 @@ def resolve_original_paths(
 def _try_panel_title(try_key: str) -> str:
     if try_key in TRY_TITLE:
         return TRY_TITLE[try_key]
+    m = re.fullmatch(r"try_(\d+)(?:_noz)?", try_key)
+    if m:
+        return f"_{m.group(1)}"
     m = re.fullmatch(r"(?:.*_)?(\d+)_try", try_key)
     if m:
         return f"_{m.group(1)}"
@@ -134,6 +146,15 @@ def _try_panel_title(try_key: str) -> str:
     if m:
         return f"_{m.group(1)}"
     return try_key
+
+
+def _normalize_source_key(key: str) -> str:
+    key = key.strip().lower().replace("-", "_")
+    return TRY_ALIASES.get(key, key)
+
+
+def _is_try_key(key: str) -> bool:
+    return key in TRY_NAMES or key.startswith("try_")
 
 
 def _pick_try_subdir(try_root: pathlib.Path, prefer_seed: int) -> pathlib.Path:
@@ -147,13 +168,13 @@ def _pick_try_subdir(try_root: pathlib.Path, prefer_seed: int) -> pathlib.Path:
     # Prefer Dered{seed}_* then any Dered*_*, else first child with latents.
     seed_order = (prefer_seed, *[s for s in PREFERRED_SPLIT_SEEDS if s != prefer_seed])
     for seed in seed_order:
-        pat = re.compile(rf"^Dered{seed}(_\d+)?$", re.IGNORECASE)
+        pat = re.compile(rf"^(Dered|Nodered){seed}(_\d+)?$", re.IGNORECASE)
         for p in subdirs:
             if pat.fullmatch(p.name):
                 return p
 
     for p in subdirs:
-        if p.name.lower().startswith("dered"):
+        if p.name.lower().startswith(("dered", "nodered")):
             return p
 
     for p in subdirs:
@@ -215,7 +236,7 @@ def resolve_sources(
     out: list[LatentSource] = []
     for raw in source_names:
         name = raw.strip()
-        key = name.lower().replace("-", "_")
+        key = _normalize_source_key(name)
         if key in ("original", "twinsanity", "legacy"):
             npz, meta = resolve_original_paths(original_npz, original_meta)
             src = load_from_npz_meta(
@@ -230,7 +251,7 @@ def resolve_sources(
                 "1024d2",
                 (henna_root / "1024d2").resolve(),
             )
-        elif key in TRY_NAMES or key.endswith("_try"):
+        elif _is_try_key(key):
             try_root = henna_root / key
             sub = _pick_try_subdir(try_root, prefer_seed)
             src = load_from_latent_dir(key, _try_panel_title(key), sub.resolve())
@@ -372,7 +393,7 @@ def default_source_names(*, all_tries: bool, include_1024d2: bool) -> list[str]:
     if all_tries:
         names.extend([t for t in TRY_NAMES if (HENNA_ROOT / t).is_dir()])
     else:
-        for t in ("five_try", "six_try"):
+        for t in ("try_5", "try_6"):
             if (HENNA_ROOT / t).is_dir():
                 names.append(t)
     return names
@@ -387,14 +408,14 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Comma-separated sources: original,1024d2,second_try,...,six_try "
-            "and/or paths to latent dirs. Default: original + five_try + six_try."
+            "Comma-separated sources: original,1024d2,try_2,...,try_6 "
+            "and/or paths to latent dirs. Default: original + try_5 + try_6."
         ),
     )
     parser.add_argument(
         "--all-tries",
         action="store_true",
-        help="Include every existing *_try under data/wiserep_henna (with original).",
+        help="Include every existing try_* under data/wiserep_henna (with original).",
     )
     parser.add_argument(
         "--include-1024d2",

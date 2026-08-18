@@ -95,7 +95,7 @@ def main() -> None:
         const.SPLITS_JSON_HENNA_MATCHED_Z,
     )
     compare_variant(
-        "henna Noderedshift (observed frame)",
+        "henna noderedshift (observed frame)",
         const.PROCESSED_META_HENNA_NOZ,
         const.SPLITS_JSON_HENNA_MATCHED_NOZ,
     )

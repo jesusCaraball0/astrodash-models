@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import time
 from typing import Any, Dict, List, Sequence
 
@@ -45,8 +46,11 @@ TRAIN_RNG_SEED = 0
 
 HENNA_ROOT = _PROJECT_ROOT / "data" / "wiserep_henna"
 TEST_ROOT = WISEREP_DIR / "Test"
-# Default root for --latent-dirs runs (keeps existing daep_comparison/iter_* untouched).
-DEFAULT_LATENT_DIRS_OUT_ROOT = TEST_ROOT / "daep_comparison_split_z"
+# --latent-dirs writes data/pre_trained_models/daep_latent/<try_N>/split_<seed>/
+DEFAULT_LATENT_DIRS_OUT_ROOT = (
+    _PROJECT_ROOT / "data" / "pre_trained_models" / "daep_latent"
+)
+_SEED_DIR_RE = re.compile(r"(?:dered|nodered)(\d+)", re.IGNORECASE)
 
 
 def latent_dir_for(use_redshift: bool) -> pathlib.Path:
@@ -56,6 +60,22 @@ def latent_dir_for(use_redshift: bool) -> pathlib.Path:
 
 def out_dir_for(use_redshift: bool, seed: int) -> pathlib.Path:
     return TEST_ROOT / ("daep_comparison" if use_redshift else "daep_comparison_noz") / f"iter_{seed}"
+
+
+def split_run_name(latent_dir: pathlib.Path) -> str:
+    """Dered36_5 / Nodered73_6 → split_36 / split_73."""
+    m = _SEED_DIR_RE.search(pathlib.Path(latent_dir).name)
+    return f"split_{m.group(1)}" if m else pathlib.Path(latent_dir).name
+
+
+def try_run_name(latent_dir: pathlib.Path) -> str:
+    """Parent folder, e.g. try_5 or try_5_noz."""
+    return pathlib.Path(latent_dir).parent.name
+
+
+def latent_dirs_out_dir(latent_dir: pathlib.Path, out_root: pathlib.Path) -> pathlib.Path:
+    """<out-root>/<try_N>/split_<seed>/."""
+    return pathlib.Path(out_root) / try_run_name(latent_dir) / split_run_name(latent_dir)
 
 
 def load_assignment_indices_from_dir(
@@ -613,12 +633,12 @@ def run_latent_dirs(
     train_seed: int,
     train_overrides: Dict[str, Any] | None = None,
 ) -> None:
-    """Train one latent classifier per directory; write under out_root/<dirname>/."""
+    """Train one latent classifier per directory; write under out_root/<try_N>/split_<seed>/."""
     out_root = pathlib.Path(out_root).resolve()
     for latent_dir in latent_dirs:
         latent_dir = pathlib.Path(latent_dir).resolve()
-        run_name = latent_dir.name
-        out_dir = out_root / run_name
+        run_name = split_run_name(latent_dir)
+        out_dir = latent_dirs_out_dir(latent_dir, out_root)
         cfg_json = latent_dir / "cfg_used.json"
         meta, z, latent_npz, meta_csv = load_latent_and_meta(latent_dir)
         raw_tr, raw_va, raw_te, split_source = load_assignment_indices_from_dir(latent_dir, meta)
@@ -672,7 +692,7 @@ def main() -> None:
         help=(
             f"Parent output directory for --latent-dirs runs "
             f"(default: {DEFAULT_LATENT_DIRS_OUT_ROOT}). "
-            "Each job writes to <out-root>/<dirname>/."
+            "Each job writes to <out-root>/<try_N>/split_<seed>/."
         ),
     )
     parser.add_argument(
