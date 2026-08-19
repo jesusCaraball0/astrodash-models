@@ -164,6 +164,7 @@ def make_loader(
     device: torch.device,
     shuffle: bool = False,
     batch_size: int = 64,
+    flux_cache=None,
 ) -> DataLoader:
     ds = dash_retrain.WISeREPDataset(
         filenames,
@@ -171,6 +172,7 @@ def make_loader(
         metadata,
         target_length=const.TARGET_LENGTH,
         has_redshift=has_redshift,
+        flux_cache=flux_cache,
     )
     return DataLoader(
         ds,

@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ for _name in ("spectrum_io", "dash_preprocess"):
     logging.getLogger(_name).setLevel(logging.CRITICAL)
 
 import helpers as helpers
+from cache_dash_preprocessed import model_input_from_cache, resolve_flux_cache
 
 class WISeREPDataset(Dataset):
     """
@@ -52,15 +53,18 @@ class WISeREPDataset(Dataset):
         metadata: Dict[str, Dict[str, str]],
         target_length: int = const.TARGET_LENGTH,
         has_redshift: bool = True,
+        flux_cache: Any = None,
     ):
         self.spectra_dir = spectra_dir
         self.target_length = target_length
         self.has_redshift = has_redshift
+        self.flux_cache = flux_cache
 
         # only keep files that have a valid label and redshift
         # samples: (filename, label_idx, redshift)
         self.samples: List[Tuple[str, int, float]] = []
         skipped = 0
+        skipped_cache = 0
         for fname in filenames:
             meta = metadata.get(fname)
             if meta is None:
@@ -76,13 +80,30 @@ class WISeREPDataset(Dataset):
                 z_val = float(z_raw) if z_raw else 0.0
             except ValueError:
                 z_val = 0.0
+            if flux_cache is not None and fname not in flux_cache:
+                skipped_cache += 1
+                continue
             self.samples.append((fname, const.CLASS_TO_IDX[label], z_val))
+        if flux_cache is not None:
+            print(
+                f"[cache] dataset kept {len(self.samples)} / "
+                f"{len(self.samples) + skipped_cache} ascii "
+                f"(dropped {skipped_cache} not in cache)",
+                flush=True,
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Optional[Tuple[torch.Tensor, int]]:
         fname, label_idx, z_val = self.samples[idx]
+        if self.flux_cache is not None:
+            processed = model_input_from_cache(
+                self.flux_cache.flux_row(fname),
+                z_val,
+                has_redshift=self.has_redshift,
+            )
+            return torch.from_numpy(processed), label_idx
         filepath = self.spectra_dir / fname
         result = helpers.load_spectrum(filepath)
         if result is None:
@@ -467,6 +488,17 @@ def main() -> None:
         default=None,
         help="Output directory for checkpoints/config (default: depends on mode).",
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="DASH preprocessed cache dir (default: data/wiserep/dash_preprocessed/{z,noz}).",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Read ASCII and preprocess on the fly even if a cache exists.",
+    )
     args = parser.parse_args()
 
     matched_flags = sum(bool(x) for x in (args.parquet_ruiyao, args.daep_matched, args.henna_matched))
@@ -581,6 +613,11 @@ def main() -> None:
         val_filenames = list(splits["val"])
         splits_file = str(splits_path)
         class_weights = helpers.compute_class_weights_from_filenames(train_filenames, metadata)
+        flux_cache = None if args.parquet_ruiyao else resolve_flux_cache(
+            has_redshift,
+            cache_dir=args.cache_dir,
+            disable=bool(args.no_cache),
+        )
         train_loader = helpers.make_loader(
             train_filenames,
             metadata,
@@ -588,6 +625,7 @@ def main() -> None:
             device,
             shuffle=True,
             batch_size=const.BATCH_SIZE,
+            flux_cache=flux_cache,
         )
         val_loader = helpers.make_loader(
             val_filenames,
@@ -595,6 +633,7 @@ def main() -> None:
             has_redshift,
             device,
             batch_size=const.BATCH_SIZE,
+            flux_cache=flux_cache,
         )
         print(
             f"Effective dataset sizes: train={len(train_loader.dataset)}  "
@@ -632,6 +671,15 @@ def main() -> None:
         training_config["processed_meta_csv"] = processed_meta_csv
     if parquet_training_config_extra is not None:
         training_config.update(parquet_training_config_extra)
+    if not args.parquet_ruiyao:
+        cache_used = None if args.no_cache else (
+            str(args.cache_dir.resolve()) if args.cache_dir is not None else None
+        )
+        # Record the cache actually loaded (if any) on the loaders' dataset.
+        ds_cache = getattr(train_loader.dataset, "flux_cache", None)
+        training_config["dash_cache"] = (
+            str(ds_cache.cache_dir) if ds_cache is not None else cache_used
+        )
 
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
