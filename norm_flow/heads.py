@@ -21,6 +21,15 @@ def _as_1d(y: torch.Tensor) -> torch.Tensor:
     return y.reshape(-1)
 
 
+def _weighted_mean(per_sample: torch.Tensor, sample_weight: torch.Tensor | None) -> torch.Tensor:
+    """L = sum(w * ell) / sum(w). Unweighted mean if ``sample_weight`` is None."""
+    ell = per_sample.reshape(-1)
+    if sample_weight is None:
+        return ell.mean()
+    w = sample_weight.reshape(-1).to(device=ell.device, dtype=ell.dtype)
+    return (w * ell).sum() / w.sum().clamp(min=1e-8)
+
+
 def _ndtri(probs: torch.Tensor) -> torch.Tensor:
     """Inverse standard-normal CDF (quantile function of N(0,1))."""
     p = probs.clamp(1e-6, 1.0 - 1e-6)
@@ -36,8 +45,16 @@ class MSEHead(nn.Module):
         super().__init__()
         self.lin = nn.Linear(context_dim, 1)
 
-    def loss(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return F.mse_loss(self.point_y(context), _as_1d(y))
+    def per_sample_loss(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return (self.point_y(context) - _as_1d(y)) ** 2
+
+    def loss(
+        self,
+        context: torch.Tensor,
+        y: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _weighted_mean(self.per_sample_loss(context, y), sample_weight)
 
     def point_y(self, context: torch.Tensor) -> torch.Tensor:
         return self.lin(context).squeeze(-1)
@@ -70,8 +87,16 @@ class GaussianHead(nn.Module):
         sigma = F.softplus(raw[..., 1]) + self.sigma_eps
         return mu, sigma
 
-    def loss(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return -self.log_prob_y(context, y).mean()
+    def per_sample_loss(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return -self.log_prob_y(context, y)
+
+    def loss(
+        self,
+        context: torch.Tensor,
+        y: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _weighted_mean(self.per_sample_loss(context, y), sample_weight)
 
     def point_y(self, context: torch.Tensor) -> torch.Tensor:
         mu, _ = self.params(context)
@@ -113,6 +138,7 @@ class SplineFlowHead(nn.Module):
         bins: int = 8,
         transforms: int = 2,
         hidden: int = 256,
+        hidden_layers: int = 2,
         slope: float = 1e-3,
         n_crps_samples: int = 128,
     ):
@@ -123,12 +149,15 @@ class SplineFlowHead(nn.Module):
             raise ImportError(
                 "Conditional spline flow requires zuko. Install with: pip install 'zuko>=1.4'"
             ) from exc
+        n_hidden = int(hidden_layers)
+        if n_hidden < 1:
+            raise ValueError(f"hidden_layers must be >= 1, got {n_hidden}")
         self.flow = NSF(
             features=1,
             context=int(context_dim),
             bins=int(bins),
             transforms=int(transforms),
-            hidden_features=(int(hidden), int(hidden)),
+            hidden_features=tuple(int(hidden) for _ in range(n_hidden)),
             slope=float(slope),
         )
         self.n_crps_samples = int(n_crps_samples)
@@ -149,8 +178,16 @@ class SplineFlowHead(nn.Module):
     def _dist(self, context: torch.Tensor):
         return self.flow(context)
 
-    def loss(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return -self.log_prob_y(context, y).mean()
+    def per_sample_loss(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return -self.log_prob_y(context, y)
+
+    def loss(
+        self,
+        context: torch.Tensor,
+        y: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _weighted_mean(self.per_sample_loss(context, y), sample_weight)
 
     def log_prob_y(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         y_std = self.standardize(_as_1d(y).unsqueeze(-1))
@@ -216,11 +253,18 @@ class MixtureSplineHead(nn.Module):
         bins: int = 8,
         transforms: int = 2,
         hidden: int = 256,
+        hidden_layers: int = 2,
         slope: float = 1e-3,
         n_crps_samples: int = 128,
     ):
         super().__init__()
-        kw = dict(bins=bins, transforms=transforms, hidden=hidden, slope=slope)
+        kw = dict(
+            bins=bins,
+            transforms=transforms,
+            hidden=hidden,
+            hidden_layers=hidden_layers,
+            slope=slope,
+        )
         self.low = SplineFlowHead(context_dim, **kw)
         self.high = SplineFlowHead(context_dim, **kw)
         self.gate = nn.Linear(int(context_dim), 1)
@@ -238,8 +282,16 @@ class MixtureSplineHead(nn.Module):
     def gate_pi_low(self, context: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.gate(context).squeeze(-1)).clamp(PI_EPS, 1.0 - PI_EPS)
 
-    def loss(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return -self.log_prob_y(context, y).mean()
+    def per_sample_loss(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return -self.log_prob_y(context, y)
+
+    def loss(
+        self,
+        context: torch.Tensor,
+        y: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _weighted_mean(self.per_sample_loss(context, y), sample_weight)
 
     def log_prob_y(self, context: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         pi = self.gate_pi_low(context)
@@ -301,6 +353,7 @@ def build_head(
     bins: int = 8,
     transforms: int = 2,
     hidden: int = 256,
+    hidden_layers: int = 2,
     slope: float = 1e-3,
 ) -> nn.Module:
     kind = str(kind).lower()
@@ -310,11 +363,21 @@ def build_head(
         return GaussianHead(context_dim)
     if kind == "flow":
         return SplineFlowHead(
-            context_dim, bins=bins, transforms=transforms, hidden=hidden, slope=slope
+            context_dim,
+            bins=bins,
+            transforms=transforms,
+            hidden=hidden,
+            hidden_layers=hidden_layers,
+            slope=slope,
         )
     if kind == "moe":
         return MixtureSplineHead(
-            context_dim, bins=bins, transforms=transforms, hidden=hidden, slope=slope
+            context_dim,
+            bins=bins,
+            transforms=transforms,
+            hidden=hidden,
+            hidden_layers=hidden_layers,
+            slope=slope,
         )
     raise ValueError(f"Unknown head {kind!r}; expected one of {HEADS}")
 

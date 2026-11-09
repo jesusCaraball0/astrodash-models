@@ -272,14 +272,17 @@ def train_latent_classifier(
             metrics_title="Validation metrics",
             print_summary=True,
         )
-        test_loss, test_acc, _ = evaluate(
-            model,
-            te_load,
-            loss_fn,
-            device,
-            metrics_title="Test metrics",
-            print_summary=False,
-        )
+        if len(te_load.dataset) == 0:
+            test_loss, test_acc = float("nan"), float("nan")
+        else:
+            test_loss, test_acc, _ = evaluate(
+                model,
+                te_load,
+                loss_fn,
+                device,
+                metrics_title="Test metrics",
+                print_summary=False,
+            )
 
         train_loss_ep = _mean(tl)
         loss_by_epoch.append(

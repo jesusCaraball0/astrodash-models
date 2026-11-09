@@ -6,8 +6,8 @@ dash_ensemble_plots-style PNGs:
   - train/validation loss curves (mean ± std across runs)
 
 Usage:
-  python WiserepData/daep_init_ensemble_plots.py WiserepData/Test/daep_comparison_init
-  python WiserepData/daep_init_ensemble_plots.py WiserepData/Test/daep_comparison_init_noz
+  python WiserepData/daep_init_ensemble_plots.py data/pre_trained_models/daep_init/try_5
+  python WiserepData/daep_init_ensemble_plots.py data/pre_trained_models/daep_init/try_5_noz
 """
 
 from __future__ import annotations
@@ -42,38 +42,49 @@ from TwinsClassifier_Wiserep import (
     REPO,
     LabeledSpectra,
     MeanPoolClassifier,
+    n_hidden_layers_from_state,
     collate_labeled,
     data_dir_for,
     evaluate,
     filter_indices_mapped,
+    flux_test_indices_for_init_run,
     load_preprocessed_for_classifier,
 )
+from train_latent import normalize_latent_meta
 from TwinsModel_Wiserep import build_daep, default_cfg, device_from_str, repo_import_setup
 from TwinsTrain_Wiserep import set_seeds
 
 ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
+SPLIT_DIR_RE = re.compile(r"^split_(\d+)$")
 CKPT_NAME = "classifier_best.pt"
 
 
-def _iter_sort_key(path: pathlib.Path) -> tuple[int, str]:
-    match = ITER_DIR_RE.fullmatch(path.name)
+def _run_sort_key(path: pathlib.Path) -> tuple[int, str]:
+    match = ITER_DIR_RE.fullmatch(path.name) or SPLIT_DIR_RE.fullmatch(path.name)
     return (int(match.group(1)) if match else sys.maxsize, path.name)
 
 
 def discover_run_dirs(root: pathlib.Path) -> list[pathlib.Path]:
-    runs = [
-        p
-        for p in root.iterdir()
-        if p.is_dir()
-        and (p / CKPT_NAME).is_file()
-        and (p / "model_performance.json").is_file()
-        and ITER_DIR_RE.fullmatch(p.name)
-    ]
+    split_runs: list[pathlib.Path] = []
+    iter_runs: list[pathlib.Path] = []
+    for path in root.iterdir():
+        if not (
+            path.is_dir()
+            and (path / CKPT_NAME).is_file()
+            and (path / "model_performance.json").is_file()
+        ):
+            continue
+        if SPLIT_DIR_RE.fullmatch(path.name):
+            split_runs.append(path)
+        elif ITER_DIR_RE.fullmatch(path.name):
+            iter_runs.append(path)
+    runs = split_runs or iter_runs
     if not runs:
         raise FileNotFoundError(
-            f"No runs with {CKPT_NAME} and model_performance.json under {root.resolve()}"
+            f"No split_* or iter_* runs with {CKPT_NAME} and model_performance.json "
+            f"under {root.resolve()}"
         )
-    return sorted(runs, key=_iter_sort_key)
+    return sorted(runs, key=_run_sort_key)
 
 
 def _load_cfg(run_dir: pathlib.Path, ckpt: dict) -> dict:
@@ -91,10 +102,10 @@ def _has_redshift_from_root(root: pathlib.Path) -> bool:
     return not ("noz" in name or "no_z" in name or "nodered" in name)
 
 
-def _title_prefix(has_redshift: bool) -> str:
-    if has_redshift:
-        return "DAEP (no diffusion) with Redshift"
-    return "DAEP (no diffusion) without Redshift"
+def _title_prefix(has_redshift: bool, *, data_split: bool) -> str:
+    z_tag = "with Redshift" if has_redshift else "without Redshift"
+    split_tag = "data-split ensemble" if data_split else "training-seed ensemble"
+    return f"DAEP (no diffusion) {z_tag} ({split_tag})"
 
 
 def _row_normalize_cm(cm: np.ndarray) -> np.ndarray:
@@ -183,14 +194,24 @@ def _stack_loss_curves(
     )
 
 
-def _build_model(cfg: dict, device: torch.device) -> MeanPoolClassifier:
+def _build_model(
+    cfg: dict,
+    device: torch.device,
+    head_state: dict | None = None,
+) -> MeanPoolClassifier:
     repo_import_setup(str(REPO.resolve()))
+    n_hidden = (
+        n_hidden_layers_from_state(head_state)
+        if head_state is not None
+        else int(cfg.get("n_hidden_layers", 1))
+    )
     return MeanPoolClassifier(
         build_daep(cfg).to(device).encoder,
         int(cfg["bottleneck_dim"]) * int(cfg["bottleneck_length"]),
         NUM_CLASSES,
         head_hidden=int(cfg["ff_dim"]),
-        head_dropout=float(cfg.get("dropout", 0.1)),
+        head_dropout=float(cfg.get("head_dropout", cfg.get("dropout", 0.1))),
+        n_hidden_layers=n_hidden,
     ).to(device)
 
 
@@ -204,7 +225,7 @@ def main() -> None:
         type=pathlib.Path,
         nargs="?",
         default=default_root,
-        help="Folder containing iter_0, iter_1, …",
+        help="Folder containing split_<seed> or iter_<n> runs.",
     )
     parser.add_argument(
         "--cm-out",
@@ -222,8 +243,16 @@ def main() -> None:
 
     comparison_dir = args.comparison_root.expanduser().resolve()
     run_dirs = discover_run_dirs(comparison_dir)
-    cm_out = (args.cm_out or comparison_dir / "daep_cm.png").expanduser().resolve()
-    loss_out = (args.loss_out or comparison_dir / "daep_loss_curves.png").expanduser().resolve()
+    data_split = all(SPLIT_DIR_RE.fullmatch(path.name) for path in run_dirs)
+    if data_split:
+        plots_dir = comparison_dir / "plots"
+        cm_default = plots_dir / "data_split_ensemble_test_cm.png"
+        loss_default = plots_dir / "data_split_ensemble_loss_curves.png"
+    else:
+        cm_default = comparison_dir / "daep_cm.png"
+        loss_default = comparison_dir / "daep_loss_curves.png"
+    cm_out = (args.cm_out or cm_default).expanduser().resolve()
+    loss_out = (args.loss_out or loss_default).expanduser().resolve()
 
     set_seeds(0)
     device = device_from_str(DEVICE)
@@ -231,22 +260,18 @@ def main() -> None:
     data_dir = data_dir_for(has_redshift).resolve()
 
     meta, wave, flux, mask = load_preprocessed_for_classifier(data_dir)
-    _, _, te_idx = split_row_indices_by_iau_train_val_test(
-        meta,
-        IAU_COLUMN,
-        IAU_TRAIN_FRAC,
-        IAU_VAL_FRAC,
-        IAU_TEST_FRAC,
-        IAU_SPLIT_SEED,
-    )
-    te_idx = filter_indices_mapped(meta, te_idx, LABEL_COLUMN)
-    te_load = DataLoader(
-        LabeledSpectra(meta, wave, flux, mask, te_idx, LABEL_COLUMN),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        collate_fn=collate_labeled,
-        num_workers=0,
-    )
+    meta = normalize_latent_meta(meta)
+    shared_te: np.ndarray | None = None
+    if not data_split:
+        _, _, shared_te = split_row_indices_by_iau_train_val_test(
+            meta,
+            IAU_COLUMN,
+            IAU_TRAIN_FRAC,
+            IAU_VAL_FRAC,
+            IAU_TEST_FRAC,
+            IAU_SPLIT_SEED,
+        )
+        shared_te = filter_indices_mapped(meta, shared_te, LABEL_COLUMN)
 
     loss_fn = nn.CrossEntropyLoss()
     cm_raw_runs: list[np.ndarray] = []
@@ -262,10 +287,21 @@ def main() -> None:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         cfg = _load_cfg(run_dir, ckpt)
 
-        model = _build_model(cfg, device)
+        model = _build_model(cfg, device, head_state=ckpt["head_state_dict"])
         model.encoder.load_state_dict(ckpt["encoder_state_dict"])
         model.head.load_state_dict(ckpt["head_state_dict"])
 
+        if data_split:
+            te_idx, split_src = flux_test_indices_for_init_run(run_dir, meta)
+        else:
+            te_idx, split_src = shared_te, f"iau_split_seed={IAU_SPLIT_SEED}"
+        te_load = DataLoader(
+            LabeledSpectra(meta, wave, flux, mask, te_idx, LABEL_COLUMN),
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            collate_fn=collate_labeled,
+            num_workers=0,
+        )
         _, _, cm_list = evaluate(
             model,
             te_load,
@@ -279,7 +315,7 @@ def main() -> None:
         cm_recall_runs.append(_row_normalize_cm(cm) * 100.0)
         cm_precision_runs.append(_col_normalize_cm(cm) * 100.0)
         loss_curves.append(_loss_curves_from_json(perf_path))
-        print(f"Loaded {run_dir.name}")
+        print(f"Loaded {run_dir.name}  test_n={len(te_idx)}  split={split_src}")
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -342,7 +378,7 @@ def main() -> None:
         mat_std_pct=cm_recall_std,
     )
     fig_cm.suptitle(
-        f"{_title_prefix(has_redshift)} Confusion Matrix | "
+        f"{_title_prefix(has_redshift, data_split=data_split)} Confusion Matrix | "
         f"accuracy {100.0 * acc:.1f} ± {100.0 * acc_std:.1f}%",
         y=1.02,
     )

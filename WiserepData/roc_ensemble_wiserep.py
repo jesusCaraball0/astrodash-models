@@ -44,11 +44,13 @@ from TwinsClassifier_Wiserep import (
     LABEL_COLUMN,
     LabeledSpectra,
     MeanPoolClassifier,
+    n_hidden_layers_from_state,
     NUM_CLASSES,
     REPO,
     TEST_ROOT,
     collate_labeled,
     filter_indices_mapped,
+    flux_test_indices_for_init_run,
     load_preprocessed_for_classifier,
 )
 from TwinsModel_Wiserep import build_daep, default_cfg, device_from_str, repo_import_setup
@@ -241,7 +243,8 @@ def build_loader_daep(
         int(cfg["bottleneck_dim"]) * int(cfg["bottleneck_length"]),
         NUM_CLASSES,
         int(cfg["ff_dim"]),
-        float(cfg.get("dropout", 0.1)),
+        float(cfg.get("head_dropout", cfg.get("dropout", 0.1))),
+        n_hidden_layers=n_hidden_layers_from_state(ckpt["head_state_dict"]),
     ).to(device)
     model.encoder.load_state_dict(ckpt["encoder_state_dict"])
     model.head.load_state_dict(ckpt["head_state_dict"])
@@ -347,7 +350,7 @@ def run_models(
     Evaluate each run on its own test split.
 
     Latent runs load z/meta from that checkpoint's cfg and use assignment indices when present.
-    DAEP-init runs share the IAU seed-0 test split on the classifier data_dir bundle.
+    DAEP-init split_* runs use that seed's assignment test rows. iter_* runs share IAU seed 0.
     """
     wave = flux = mask = None
     shared_daep_meta: pd.DataFrame | None = None
@@ -364,21 +367,30 @@ def run_models(
         if "encoder_state_dict" in ckpt:
             if shared_daep_meta is None:
                 shared_daep_meta, wave, flux, mask = load_preprocessed_for_classifier(DATA_DIR)
-                _, _, shared_daep_te = split_row_indices_by_iau_train_val_test(
-                    shared_daep_meta,
-                    IAU_COLUMN,
-                    IAU_TRAIN_FRAC,
-                    IAU_VAL_FRAC,
-                    IAU_TEST_FRAC,
-                    IAU_SPLIT_SEED,
-                )
-                shared_daep_te = filter_indices_mapped(
-                    shared_daep_meta, shared_daep_te, LABEL_COLUMN
-                )
+                shared_daep_meta = normalize_latent_meta(shared_daep_meta)
+            cfg = _cfg_from_ckpt(run_dir, ckpt)
+            if isinstance(cfg.get("split_source"), str) and str(cfg["split_source"]).startswith(
+                "assignment:"
+            ):
+                te_idx, split_src = flux_test_indices_for_init_run(run_dir, shared_daep_meta)
+            else:
+                if shared_daep_te is None:
+                    _, _, shared_daep_te = split_row_indices_by_iau_train_val_test(
+                        shared_daep_meta,
+                        IAU_COLUMN,
+                        IAU_TRAIN_FRAC,
+                        IAU_VAL_FRAC,
+                        IAU_TEST_FRAC,
+                        IAU_SPLIT_SEED,
+                    )
+                    shared_daep_te = filter_indices_mapped(
+                        shared_daep_meta, shared_daep_te, LABEL_COLUMN
+                    )
+                te_idx = shared_daep_te
+                split_src = f"iau_split_seed={IAU_SPLIT_SEED}"
             model, loader = build_loader_daep(
-                run_dir, ckpt, shared_daep_meta, shared_daep_te, wave, flux, mask, device
+                run_dir, ckpt, shared_daep_meta, te_idx, wave, flux, mask, device
             )
-            split_src = f"iau_split_seed={IAU_SPLIT_SEED}"
         else:
             cfg = _cfg_from_ckpt(run_dir, ckpt)
             ckpt = {**ckpt, "cfg": {**(ckpt.get("cfg") or {}), **cfg}}

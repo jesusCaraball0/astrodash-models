@@ -59,9 +59,13 @@ def split_row_indices_by_iau_train_val_test(
     va_idx = np.flatnonzero(v & np.isin(row_iaus, list(val_iaus)))
     te_idx = np.flatnonzero(v & np.isin(row_iaus, list(test_iaus)))
 
-    if tr_idx.size == 0 or va_idx.size == 0 or te_idx.size == 0:
+    if tr_idx.size == 0 or va_idx.size == 0:
         raise RuntimeError(
             f"Empty split after IAU partition: train={tr_idx.size} val={va_idx.size} test={te_idx.size}"
+        )
+    if float(test_frac) > 0 and te_idx.size == 0:
+        raise RuntimeError(
+            f"Empty test split after IAU partition: train={tr_idx.size} val={va_idx.size} test={te_idx.size}"
         )
 
     return tr_idx.astype(np.int64), va_idx.astype(np.int64), te_idx.astype(np.int64)

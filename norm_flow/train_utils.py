@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -19,10 +19,32 @@ from evaluate import (
     write_all_plots,
     write_predictions_csv,
 )
+from heads import FLOW_LIKE_HEADS
 from models import TARGETS, RedshiftPredictor, encode_y
 
 Z_FLOOR = 1e-4
 Z_MAX = 6.0
+NSF_BOUND = 5.0
+BETTER_HPS_Z_COVER = 2.0
+BETTER_HPS_BINS = 64
+DEFAULT_FLOW_BINS = 8
+DEFAULT_FLOW_TRANSFORMS = 2
+DEFAULT_FLOW_HIDDEN_LAYERS = 2
+DEFAULT_TRUNK_LAYERS = 1
+DEEPER_BINS = 16
+DEEPER_FLOW_HIDDEN_LAYERS = 3
+DEEPER_TRUNK_LAYERS = 2
+REWEIGHT_ALPHA = 0.5
+# Same physical-z bins as the MAE-by-z tables / class-vs-redshift figure.
+REWEIGHT_Z_BINS = (0.0, 0.05, 0.10, 0.20, 0.40, 0.80, 6.0)
+REWEIGHT_Z_BIN_LABELS = (
+    "[0, 0.05)",
+    "[0.05, 0.10)",
+    "[0.10, 0.20)",
+    "[0.20, 0.40)",
+    "[0.40, 0.80)",
+    "[0.80, 6)",
+)
 
 
 def to_logz(z: torch.Tensor, z_floor: float = Z_FLOOR) -> torch.Tensor:
@@ -46,9 +68,212 @@ def jacobian_note(target: str) -> str:
     return "log p_z(z|x) = log p_y(z|x) (identity; model trained in physical z)"
 
 
+def covering_std(
+    mean: float,
+    empirical_std: float,
+    *,
+    z_lo: float,
+    z_hi: float,
+    bound: float = NSF_BOUND,
+) -> float:
+    """Smallest std so [z_lo, z_hi] lands in the NSF interval [-bound, bound].
+
+    u = (z - mean) / std. Keep the train mean (bulk near u=0) and widen std
+    until z_hi maps to +bound. Does not change the training label; y is still z.
+    """
+    bound = float(bound)
+    if bound <= 0.0:
+        raise ValueError(f"NSF bound must be positive, got {bound}")
+    need_hi = (float(z_hi) - float(mean)) / bound
+    need_lo = (float(mean) - float(z_lo)) / bound
+    return max(float(empirical_std), need_hi, need_lo, 1e-3)
+
+
+def resolve_better_hps(
+    *,
+    better_hps: bool,
+    target: str,
+    head: str,
+    bins: int | None,
+    transforms: int | None,
+) -> tuple[int, int, float | None]:
+    """Return (bins, transforms, cover_z). cover_z is None unless --better-hps."""
+    head = str(head).lower()
+    target = str(target).lower()
+    if not better_hps:
+        return (
+            DEFAULT_FLOW_BINS if bins is None else int(bins),
+            DEFAULT_FLOW_TRANSFORMS if transforms is None else int(transforms),
+            None,
+        )
+    if target != "z":
+        raise ValueError("--better-hps requires --target z (linear-z NSF covering)")
+    if head not in FLOW_LIKE_HEADS:
+        raise ValueError("--better-hps only applies to flow / moe (NSF domain + bins)")
+    return (
+        BETTER_HPS_BINS if bins is None else int(bins),
+        DEFAULT_FLOW_TRANSFORMS if transforms is None else int(transforms),
+        BETTER_HPS_Z_COVER,
+    )
+
+
+def resolve_deeper(
+    *,
+    deeper: bool,
+    head: str,
+    bins: int | None,
+) -> tuple[int | None, int, int]:
+    """Return (bins_override, flow_hidden_layers, trunk_layers).
+
+    ``bins_override`` is None when ``--deeper`` is off so ``resolve_better_hps``
+    still owns the default-8 / better-hps-64 choice.
+    """
+    head = str(head).lower()
+    if not deeper:
+        return (
+            None if bins is None else int(bins),
+            DEFAULT_FLOW_HIDDEN_LAYERS,
+            DEFAULT_TRUNK_LAYERS,
+        )
+    if head not in FLOW_LIKE_HEADS:
+        raise ValueError("--deeper only applies to flow / moe (extra trunk layer + 16 bins)")
+    return (
+        DEEPER_BINS if bins is None else int(bins),
+        DEEPER_FLOW_HIDDEN_LAYERS,
+        DEEPER_TRUNK_LAYERS,
+    )
+
+
+def output_tag(
+    target: str,
+    *,
+    cls_cond: bool = False,
+    cls_true: bool = False,
+    better_hps: bool = False,
+    deeper: bool = False,
+    reweight: bool = False,
+    aug: bool = False,
+) -> str:
+    """Infix used in daep_latent_{tag}_{head} / dash_{tag}_{head} folder names."""
+    if cls_cond and cls_true:
+        raise ValueError("cls_cond and cls_true are mutually exclusive")
+    if better_hps and deeper:
+        raise ValueError("better_hps and deeper are mutually exclusive")
+    if aug and (cls_cond or cls_true):
+        raise ValueError("aug cannot be combined with cls_cond / cls_true")
+    tag = "logz" if target == "logz" else "z"
+    if cls_true:
+        tag = f"{tag}_truecls"
+    elif cls_cond:
+        tag = f"{tag}_cls"
+    if better_hps:
+        tag = f"{tag}_betterhps"
+    if deeper:
+        tag = f"{tag}_deeper"
+    if reweight:
+        tag = f"{tag}_reweight"
+    if aug:
+        tag = f"{tag}_aug"
+    return tag
+
+
 def assert_finite(t: torch.Tensor, name: str) -> None:
     if not torch.isfinite(t).all():
         raise RuntimeError(f"Non-finite {name}: min={t.min().item() if t.numel() else 'empty'} max={t.max().item() if t.numel() else 'empty'}")
+
+
+class InverseFreqWeights:
+    """Per-sample weights w_b ∝ N_b^{-α} on physical-z bins (train counts only).
+
+    Mean-normalized so the training set has mean weight 1. The training loss is
+    L = sum(w ell) / sum(w) with ell = -log p(y|x) (or squared error for MSE).
+    For logz models, weighting -log p_y vs -log p_z differs by a z-only constant,
+    so gradients match the image formula on p(z|x).
+    """
+
+    def __init__(
+        self,
+        edges: Sequence[float],
+        counts: Sequence[int],
+        alpha: float,
+        w_bin: Sequence[float],
+    ):
+        self.edges = [float(e) for e in edges]
+        self.counts = [int(c) for c in counts]
+        self.alpha = float(alpha)
+        self.w_bin = [float(w) for w in w_bin]
+
+    @classmethod
+    def from_z(
+        cls,
+        z: np.ndarray | torch.Tensor,
+        *,
+        edges: Sequence[float] = REWEIGHT_Z_BINS,
+        alpha: float = REWEIGHT_ALPHA,
+    ) -> "InverseFreqWeights":
+        if torch.is_tensor(z):
+            z_np = z.detach().cpu().numpy().reshape(-1).astype(np.float64)
+        else:
+            z_np = np.asarray(z, dtype=np.float64).reshape(-1)
+        if z_np.size == 0:
+            raise RuntimeError("Cannot build reweight table from empty train redshifts")
+        edges_np = np.asarray(list(edges), dtype=np.float64)
+        if edges_np.size < 2:
+            raise ValueError("Need at least two bin edges")
+        idx = np.digitize(z_np, edges_np) - 1
+        idx = np.clip(idx, 0, int(edges_np.size) - 2)
+        n_bins = int(edges_np.size) - 1
+        counts = np.bincount(idx, minlength=n_bins).astype(np.float64)
+        w_bin = np.maximum(counts, 1.0) ** (-float(alpha))
+        w_i = w_bin[idx]
+        w_bin = w_bin * (float(z_np.size) / float(w_i.sum()))
+        return cls(edges_np.tolist(), counts.astype(int).tolist(), float(alpha), w_bin.tolist())
+
+    def lookup(self, z: torch.Tensor) -> torch.Tensor:
+        z1 = z.reshape(-1)
+        edges = torch.as_tensor(self.edges, device=z1.device, dtype=z1.dtype)
+        w_bin = torch.as_tensor(self.w_bin, device=z1.device, dtype=z1.dtype)
+        idx = torch.bucketize(z1, edges) - 1
+        return w_bin[idx.clamp(0, int(w_bin.numel()) - 1)]
+
+    def as_cfg(self) -> Dict[str, Any]:
+        labels = list(REWEIGHT_Z_BIN_LABELS)
+        if len(labels) != len(self.counts):
+            labels = [
+                f"[{self.edges[i]:g}, {self.edges[i + 1]:g})"
+                for i in range(len(self.counts))
+            ]
+        return {
+            "reweight": True,
+            "reweight_alpha": self.alpha,
+            "reweight_bin_edges": list(self.edges),
+            "reweight_bin_counts": list(self.counts),
+            "reweight_bin_weights": list(self.w_bin),
+            "reweight_bin_labels": labels,
+            "early_stop_loss": "weighted_nll",
+        }
+
+    def describe(self) -> str:
+        labels = self.as_cfg()["reweight_bin_labels"]
+        rows = [
+            f"  {lab:16s}  n={n:5d}  w={w:.4f}"
+            for lab, n, w in zip(labels, self.counts, self.w_bin)
+        ]
+        return (
+            f"[reweight] alpha={self.alpha:g}  w_b ∝ N_b^{{-alpha}}  "
+            f"(train mean w=1; eval NLL stays unweighted)\n" + "\n".join(rows)
+        )
+
+
+def collect_physical_z(loader: DataLoader) -> torch.Tensor:
+    zs: List[torch.Tensor] = []
+    for batch in loader:
+        if batch is None:
+            continue
+        zs.append(batch["y"].reshape(-1).detach().cpu())
+    if not zs:
+        raise RuntimeError("Empty loader; cannot collect redshifts for reweighting")
+    return torch.cat(zs)
 
 
 @torch.no_grad()
@@ -59,21 +284,27 @@ def mean_loss(
     *,
     z_floor: float,
     target: str | None = None,
+    weights: InverseFreqWeights | None = None,
 ) -> float:
     target = _target_of(model, target)
     model.eval()
     total = 0.0
-    n = 0
+    denom = 0.0
     for batch in loader:
         if batch is None:
             continue
         x = batch["x"].to(device)
-        y = to_y(batch["y"].to(device), target, z_floor)
-        loss = model.loss(x, y)
-        bs = int(x.shape[0])
-        total += float(loss.item()) * bs
-        n += bs
-    return total / max(n, 1)
+        z_phys = batch["y"].to(device)
+        y = to_y(z_phys, target, z_floor)
+        nll = model.per_sample_loss(x, y)
+        if weights is None:
+            total += float(nll.sum().item())
+            denom += float(nll.numel())
+        else:
+            w = weights.lookup(z_phys)
+            total += float((w * nll).sum().item())
+            denom += float(w.sum().item())
+    return total / max(denom, 1e-8)
 
 
 def fit_flow_y_stats(
@@ -83,6 +314,7 @@ def fit_flow_y_stats(
     *,
     z_floor: float,
     target: str | None = None,
+    cover_z: float | None = None,
 ) -> tuple[float, float]:
     target = _target_of(model, target)
     ys: List[torch.Tensor] = []
@@ -95,13 +327,32 @@ def fit_flow_y_stats(
     y = torch.cat(ys)
     mean = float(y.mean().item())
     std = float(y.std(unbiased=False).clamp(min=1e-3).item())
-    model.set_flow_y_stats(mean, std)
     y_name = "ln z" if target == "logz" else "z"
-    print(
-        f"[{model.head_kind}] standardizing y={y_name} with train mean={mean:.4f} std={std:.4f} "
-        "(zuko NSF domain is [-5, 5] after this affine map)",
-        flush=True,
-    )
+    if cover_z is not None and target == "z":
+        empir = std
+        std = covering_std(
+            mean,
+            empir,
+            z_lo=float(z_floor),
+            z_hi=float(cover_z),
+            bound=NSF_BOUND,
+        )
+        u_lo = (float(z_floor) - mean) / std
+        u_hi = (float(cover_z) - mean) / std
+        print(
+            f"[{model.head_kind}] covering z in [{z_floor:g}, {float(cover_z):g}] "
+            f"inside NSF u in [{-NSF_BOUND:g}, {NSF_BOUND:g}]: "
+            f"train mean={mean:.4f} empir_std={empir:.4f} std={std:.4f} "
+            f"u(z_floor)={u_lo:.2f} u(z={float(cover_z):g})={u_hi:.2f}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[{model.head_kind}] standardizing y={y_name} with train mean={mean:.4f} std={std:.4f} "
+            "(zuko NSF domain is [-5, 5] after this affine map)",
+            flush=True,
+        )
+    model.set_flow_y_stats(mean, std)
     return mean, std
 
 
@@ -124,6 +375,9 @@ def train_and_eval(
     title: str,
     eval_only: bool = False,
     target: str | None = None,
+    cover_z: float | None = None,
+    reweight: bool = False,
+    reweight_alpha: float = REWEIGHT_ALPHA,
 ) -> Path:
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -168,11 +422,32 @@ def train_and_eval(
         return best_path
 
     if hasattr(model.head, "set_y_stats"):
+        if cover_z is None:
+            cover_z = cfg.get("cover_z")
         y_mean, y_std = fit_flow_y_stats(
-            model, train_loader, device, z_floor=z_floor, target=target
+            model,
+            train_loader,
+            device,
+            z_floor=z_floor,
+            target=target,
+            cover_z=cover_z,
         )
         cfg["flow_y_mean"] = y_mean
         cfg["flow_y_std"] = y_std
+        cfg["cover_z"] = cover_z
+
+    weights: InverseFreqWeights | None = None
+    if reweight or bool(cfg.get("reweight")):
+        alpha = float(cfg.get("reweight_alpha", reweight_alpha) or REWEIGHT_ALPHA)
+        weights = InverseFreqWeights.from_z(
+            collect_physical_z(train_loader),
+            edges=list(cfg.get("reweight_bin_edges") or REWEIGHT_Z_BINS),
+            alpha=alpha,
+        )
+        cfg.update(weights.as_cfg())
+        print(weights.describe(), flush=True)
+    else:
+        cfg.setdefault("reweight", False)
 
     best_val = float("inf")
     best_epoch = -1
@@ -182,23 +457,30 @@ def train_and_eval(
 
     print(
         f"[train] head={model.head_kind}  target={target}  epochs={epochs}  "
-        f"patience={patience}  clip_norm={clip_norm}  out_dir={out_dir}",
+        f"patience={patience}  clip_norm={clip_norm}  reweight={weights is not None}  "
+        f"out_dir={out_dir}",
         flush=True,
     )
 
     for epoch in range(1, int(epochs) + 1):
         t0 = time.perf_counter()
         model.train()
-        running = 0.0
-        n = 0
+        running_num = 0.0
+        running_den = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False, dynamic_ncols=True)
         for batch in pbar:
             if batch is None:
                 continue
             x = batch["x"].to(device)
-            y = to_y(batch["y"].to(device), target, z_floor)
+            z_phys = batch["y"].to(device)
+            y = to_y(z_phys, target, z_floor)
+            w = None if weights is None else weights.lookup(z_phys)
             optimizer.zero_grad(set_to_none=True)
-            loss = model.loss(x, y)
+            nll = model.per_sample_loss(x, y)
+            if w is None:
+                loss = nll.mean()
+            else:
+                loss = (w * nll).sum() / w.sum().clamp(min=1e-8)
             if not torch.isfinite(loss):
                 nan_streak += 1
                 print(f"[warn] non-finite train loss at epoch {epoch} ({nan_streak} in a row)", flush=True)
@@ -210,19 +492,28 @@ def train_and_eval(
             if clip_norm is not None and clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(clip_norm))
             optimizer.step()
-            bs = int(x.shape[0])
-            running += float(loss.item()) * bs
-            n += bs
-            pbar.set_postfix(loss=f"{running / max(n, 1):.5f}")
+            if w is None:
+                running_num += float(nll.detach().sum().item())
+                running_den += float(nll.numel())
+            else:
+                running_num += float((w.detach() * nll.detach()).sum().item())
+                running_den += float(w.detach().sum().item())
+            pbar.set_postfix(loss=f"{running_num / max(running_den, 1e-8):.5f}")
 
-        train_loss = running / max(n, 1)
-        val_loss = mean_loss(model, val_loader, device, z_floor=z_floor, target=target)
+        train_loss = running_num / max(running_den, 1e-8)
+        val_loss = mean_loss(
+            model, val_loader, device, z_floor=z_floor, target=target, weights=weights
+        )
         if scheduler is not None:
             scheduler.step(val_loss)
         history.append([epoch, train_loss, val_loss])
         dt = time.perf_counter() - t0
+        extra = ""
+        if weights is not None:
+            val_unw = mean_loss(model, val_loader, device, z_floor=z_floor, target=target)
+            extra = f"  val_unweighted {val_unw:.6f}"
         print(
-            f"epoch {epoch}/{epochs} {dt:.1f}s  train {train_loss:.6f}  val {val_loss:.6f}",
+            f"epoch {epoch}/{epochs} {dt:.1f}s  train {train_loss:.6f}  val {val_loss:.6f}{extra}",
             flush=True,
         )
         if val_loss < best_val and np.isfinite(val_loss):

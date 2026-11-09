@@ -38,16 +38,31 @@ def y_to_z(y: torch.Tensor, target: str, z_floor: float, z_max: float) -> torch.
 
 
 class LatentMLPTrunk(nn.Module):
-    """Same first layer as ``LatentClassifier``: Linear → GELU → Dropout."""
+    """MLP on a frozen embedding: Linear → GELU → Dropout, repeated ``n_layers`` times.
 
-    def __init__(self, embed_dim: int, hidden: int, dropout: float):
+    Default ``n_layers=1`` matches ``LatentClassifier``. ``--deeper`` uses 2.
+    """
+
+    def __init__(self, embed_dim: int, hidden: int, dropout: float, n_layers: int = 1):
         super().__init__()
+        n_layers = int(n_layers)
+        if n_layers < 1:
+            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.context_dim = int(hidden)
-        self.net = nn.Sequential(
+        layers: list[nn.Module] = [
             nn.Linear(int(embed_dim), int(hidden)),
             nn.GELU(),
             nn.Dropout(float(dropout)),
-        )
+        ]
+        for _ in range(n_layers - 1):
+            layers.extend(
+                [
+                    nn.Linear(int(hidden), int(hidden)),
+                    nn.GELU(),
+                    nn.Dropout(float(dropout)),
+                ]
+            )
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x.reshape(x.shape[0], -1))
@@ -56,7 +71,7 @@ class LatentMLPTrunk(nn.Module):
 class DashCNNTrunk(nn.Module):
     """Dash 1D CNN up to the 256-d feature used by ``fc2`` in ``DashCNN1D``."""
 
-    def __init__(self, input_length: int):
+    def __init__(self, input_length: int, extra_fc: bool = False):
         super().__init__()
         self.conv1 = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
@@ -79,6 +94,7 @@ class DashCNNTrunk(nn.Module):
         conv_out_length = int(input_length) // (4 * 4 * 4)
         self.flat_size = 128 * conv_out_length
         self.fc1 = nn.Linear(self.flat_size, 256)
+        self.fc_extra = nn.Linear(256, 256) if extra_fc else None
         self.dropout = nn.Dropout(0.5)
         self.context_dim = 256
 
@@ -89,7 +105,10 @@ class DashCNNTrunk(nn.Module):
         x = self.conv3(x)
         x = x.flatten(1)
         x = F.relu(self.fc1(x))
-        return self.dropout(x)
+        x = self.dropout(x)
+        if self.fc_extra is not None:
+            x = self.dropout(F.relu(self.fc_extra(x)))
+        return x
 
 
 class RedshiftPredictor(nn.Module):
@@ -108,8 +127,10 @@ class RedshiftPredictor(nn.Module):
         bins: int = 8,
         transforms: int = 2,
         flow_hidden: int = 256,
+        flow_hidden_layers: int = 2,
         slope: float = 1e-3,
         target: str = "logz",
+        class_dim: int = 0,
     ):
         super().__init__()
         target = str(target).lower()
@@ -118,12 +139,14 @@ class RedshiftPredictor(nn.Module):
         self.trunk = trunk
         self.head_kind = str(head_kind).lower()
         self.target = target
+        self.class_dim = int(class_dim)
         self.head = build_head(
             self.head_kind,
-            int(trunk.context_dim),
+            int(trunk.context_dim) + self.class_dim,
             bins=bins,
             transforms=transforms,
             hidden=flow_hidden,
+            hidden_layers=flow_hidden_layers,
             slope=slope,
         )
 
@@ -132,10 +155,22 @@ class RedshiftPredictor(nn.Module):
         return is_probabilistic(self.head)
 
     def context(self, x: torch.Tensor) -> torch.Tensor:
-        return self.trunk(x)
+        if self.class_dim <= 0:
+            return self.trunk(x)
+        feat = x[:, : -self.class_dim]
+        cls = x[:, -self.class_dim :]
+        return torch.cat([self.trunk(feat), cls], dim=-1)
 
-    def loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return self.head.loss(self.context(x), y)
+    def loss(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.head.loss(self.context(x), y, sample_weight=sample_weight)
+
+    def per_sample_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return self.head.per_sample_loss(self.context(x), y)
 
     def point_y(self, x: torch.Tensor) -> torch.Tensor:
         return self.head.point_y(self.context(x))
@@ -171,7 +206,11 @@ class RedshiftPredictor(nn.Module):
             self.head.set_y_stats(mean, std)
 
     def extra_state(self) -> dict[str, Any]:
-        state: dict[str, Any] = {"head_kind": self.head_kind, "target": self.target}
+        state: dict[str, Any] = {
+            "head_kind": self.head_kind,
+            "target": self.target,
+            "class_dim": self.class_dim,
+        }
         if hasattr(self.head, "y_mean"):
             state["y_mean"] = float(self.head.y_mean.reshape(-1)[0].item())
             state["y_std"] = float(self.head.y_std.reshape(-1)[0].item())

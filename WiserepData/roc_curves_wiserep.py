@@ -34,6 +34,7 @@ from TwinsClassifier_Wiserep import (
     LABEL_COLUMN,
     LabeledSpectra,
     MeanPoolClassifier,
+    n_hidden_layers_from_state,
     NUM_CLASSES,
     OUT_DIR,
     REPO,
@@ -78,7 +79,8 @@ def main() -> None:
             int(cfg["bottleneck_dim"]) * int(cfg["bottleneck_length"]),
             NUM_CLASSES,
             int(cfg["ff_dim"]),
-            float(cfg.get("dropout", 0.1)),
+            float(cfg.get("head_dropout", cfg.get("dropout", 0.1))),
+            n_hidden_layers=n_hidden_layers_from_state(ckpt["head_state_dict"]),
         ).to(device)
         model.encoder.load_state_dict(ckpt["encoder_state_dict"])
         model.head.load_state_dict(ckpt["head_state_dict"])

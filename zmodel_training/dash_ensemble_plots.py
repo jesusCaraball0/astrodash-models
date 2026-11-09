@@ -154,6 +154,39 @@ def _stack_loss_curves(
     )
 
 
+def save_precision_recall_cm(
+    cm: np.ndarray | list,
+    class_names: list[str],
+    title: str,
+    out_path: Path,
+) -> Path:
+    """Save the dual precision/recall % heatmaps used by ensemble plots (single run, no ±std)."""
+    arr = np.asarray(cm, dtype=np.float64)
+    acc = float(np.trace(arr) / arr.sum()) if arr.sum() > 0 else 0.0
+    fig, (ax_prec, ax_rec) = plt.subplots(1, 2, figsize=(14, 6))
+    _plot_normalized_cm(
+        ax_prec,
+        _col_normalize_cm(arr) * 100.0,
+        title="Precision",
+        cbar_label="Predicted Class %",
+        class_names=class_names,
+    )
+    _plot_normalized_cm(
+        ax_rec,
+        _row_normalize_cm(arr) * 100.0,
+        title="Recall",
+        cbar_label="True Class %",
+        class_names=class_names,
+    )
+    fig.suptitle(f"{title} | accuracy {100.0 * acc:.1f}%", y=1.02)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def _title_prefix(has_redshift: bool, *, data_split_ensemble: bool) -> str:
     z_tag = "with Redshift" if has_redshift else "without Redshift"
     split_tag = "data-split ensemble" if data_split_ensemble else "training-seed ensemble"

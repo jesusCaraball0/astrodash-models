@@ -33,6 +33,7 @@ from TwinsClassifier_Wiserep import (
     SEED,
     LabeledSpectra,
     MeanPoolClassifier,
+    n_hidden_layers_from_state,
     collate_labeled,
     evaluate,
     filter_indices_mapped,
@@ -153,15 +154,15 @@ def main() -> None:
         num_workers=0,
     )
 
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = MeanPoolClassifier(
         build_daep(cfg).to(device).encoder,
-        int(cfg["bottleneck_dim"]),
+        int(cfg["bottleneck_dim"]) * int(cfg["bottleneck_length"]),
         NUM_CLASSES,
         head_hidden=int(cfg["ff_dim"]),
-        head_dropout=float(cfg.get("dropout", 0.1)),
+        head_dropout=float(cfg.get("head_dropout", cfg.get("dropout", 0.1))),
+        n_hidden_layers=n_hidden_layers_from_state(ckpt["head_state_dict"]),
     ).to(device)
-
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.encoder.load_state_dict(ckpt["encoder_state_dict"])
     model.head.load_state_dict(ckpt["head_state_dict"])
 

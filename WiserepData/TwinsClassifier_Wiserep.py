@@ -1,11 +1,16 @@
 """
-WISeREP spectra -> DAEP encoder -> mean pool -> MLP -> CE
+WISeREP spectra -> DAEP encoder (no diffusion) -> flatten -> one-hidden-layer MLP -> CE.
+
+The encoder config in ``Test/cfg_used.json`` matches the Universal diffusion
+encoder (16 x 64). The head matches ``LatentClassifier``: one hidden layer.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,6 +47,10 @@ def data_dir_for(use_redshift: bool) -> pathlib.Path:
 
 def out_dir_for(use_redshift: bool, iter_idx: int) -> pathlib.Path:
     return TEST_ROOT / ("daep_comparison_init" if use_redshift else "daep_comparison_init_noz") / f"iter_{iter_idx}"
+
+
+# --latent-dirs writes data/pre_trained_models/daep_init/<try_N>/split_<seed>/
+DEFAULT_INIT_OUT_ROOT = _PROJECT_ROOT / "data" / "pre_trained_models" / "daep_init"
 
 # Labels
 LABEL_COLUMN = "Obj. Type"
@@ -99,7 +108,10 @@ BATCH_SIZE = 16
 LR = 4e-5
 WEIGHT_DECAY = 1e-4
 EPOCHS = 150
-EARLY_STOPPING_PATIENCE = 15
+EARLY_STOPPING_PATIENCE = 20
+# Encoder dropout stays in cfg["dropout"] (0.15, same as the diffusion encoder).
+# The classification MLP uses this, same as LatentClassifier.
+HEAD_DROPOUT = 0.25
 
 
 def build_daep_cfg() -> dict:
@@ -111,6 +123,9 @@ def build_daep_cfg() -> dict:
         "bottleneck_length=", cfg.get("bottleneck_length"),
         "model_dim=", cfg.get("model_dim"),
         "ff_dim=", cfg.get("ff_dim"),
+        "dropout=", cfg.get("dropout"),
+        "head_dropout=", cfg.get("head_dropout", HEAD_DROPOUT),
+        "n_hidden_layers=", cfg.get("n_hidden_layers", 1),
         flush=True,
     )
     return cfg
@@ -187,7 +202,11 @@ class LabeledSpectra(Dataset):
 
     def __getitem__(self, i: int):
         row = int(self.indices[i])
-        ph = self.meta.loc[row, "Phase (days)"] if "Phase (days)" in self.meta.columns else 0.0
+        ph = 0.0
+        for col in ("Phase (days)", "phase_used", "phase_rest", "phase_obs"):
+            if col in self.meta.columns:
+                ph = self.meta.loc[row, col]
+                break
         try:
             ph = float(ph) if np.isfinite(float(ph)) else 0.0
         except Exception:
@@ -210,6 +229,16 @@ def collate_labeled(batch: List[dict]):
     return b
 
 
+def n_hidden_layers_from_state(head_state: dict) -> int:
+    """Hidden Linear blocks in a saved head. The last Linear is the class layer."""
+    n_linear = sum(1 for key in head_state if str(key).endswith(".weight"))
+    if n_linear < 2:
+        raise ValueError(
+            f"Classification head state has {n_linear} Linear layers; expected at least 2"
+        )
+    return n_linear - 1
+
+
 class MeanPoolClassifier(nn.Module):
     def __init__(
         self,
@@ -218,18 +247,25 @@ class MeanPoolClassifier(nn.Module):
         n_cls: int,
         head_hidden: int,
         head_dropout: float,
+        n_hidden_layers: int = 1,
     ):
         super().__init__()
         self.encoder = encoder
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim, head_hidden),
-            nn.GELU(),
-            nn.Dropout(head_dropout),
-            nn.Linear(head_hidden, head_hidden),
-            nn.GELU(),
-            nn.Dropout(head_dropout),
-            nn.Linear(head_hidden, n_cls),
-        )
+        if n_hidden_layers < 1:
+            raise ValueError("n_hidden_layers must be >= 1")
+        layers: List[nn.Module] = []
+        in_dim = embed_dim
+        for _ in range(n_hidden_layers):
+            layers.extend(
+                (
+                    nn.Linear(in_dim, head_hidden),
+                    nn.GELU(),
+                    nn.Dropout(head_dropout),
+                )
+            )
+            in_dim = head_hidden
+        layers.append(nn.Linear(in_dim, n_cls))
+        self.head = nn.Sequential(*layers)
 
     def forward(self, batch: Dict) -> torch.Tensor:
         z = self.encoder.encode_raw(batch)
@@ -500,33 +536,63 @@ def train_classifier(
     return best_ckpt_path
 
 
-def run_one(use_redshift: bool, iter_idx: int):
+def run_one(
+    use_redshift: bool,
+    iter_idx: int,
+    *,
+    data_dir: pathlib.Path | None = None,
+    out_dir: pathlib.Path | None = None,
+    train_idx: np.ndarray | None = None,
+    val_idx: np.ndarray | None = None,
+    test_idx: np.ndarray | None = None,
+    split_source: str | None = None,
+    train_seed: int | None = None,
+):
     print(f"=== run start | USE_REDSHIFT={use_redshift} ITER={iter_idx} ===", flush=True)
 
     print("=== TwinsClassifier_Wiserep start ===", flush=True)
     print("[init] repo_import_setup", REPO.resolve(), flush=True)
     repo_import_setup(str(REPO))
-    set_seeds(SEED + iter_idx)
-    print("[init] seed", SEED, flush=True)
+    seed_used = SEED + iter_idx if train_seed is None else int(train_seed)
+    set_seeds(seed_used)
+    print("[init] seed", seed_used, flush=True)
 
-    data_dir = data_dir_for(use_redshift).resolve()
-    out_dir = out_dir_for(use_redshift, iter_idx).resolve()
+    data_dir = (data_dir if data_dir is not None else data_dir_for(use_redshift)).resolve()
+    out_dir = (out_dir if out_dir is not None else out_dir_for(use_redshift, iter_idx)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     device = device_from_str(DEVICE)
     print("[init] device:", device, flush=True)
 
     cfg = build_daep_cfg()
     cfg["iau_split_seed"] = IAU_SPLIT_SEED
+    cfg["head_dropout"] = float(cfg.get("head_dropout", HEAD_DROPOUT))
+    cfg["n_hidden_layers"] = int(cfg.get("n_hidden_layers", 1))
+    cfg["train_seed"] = seed_used
 
     meta, wave, flux, mask = load_preprocessed_for_classifier(data_dir)
-    tr_idx, va_idx, te_idx = split_row_indices_by_iau_train_val_test(
-        meta,
-        IAU_COLUMN,
-        IAU_TRAIN_FRAC,
-        IAU_VAL_FRAC,
-        IAU_TEST_FRAC,
-        IAU_SPLIT_SEED,
-    )
+    from train_latent import normalize_latent_meta
+
+    meta = normalize_latent_meta(meta)
+    if train_idx is None or val_idx is None or test_idx is None:
+        tr_idx, va_idx, te_idx = split_row_indices_by_iau_train_val_test(
+            meta,
+            IAU_COLUMN,
+            IAU_TRAIN_FRAC,
+            IAU_VAL_FRAC,
+            IAU_TEST_FRAC,
+            IAU_SPLIT_SEED,
+        )
+        split_source = (
+            f"iau fracs={IAU_TRAIN_FRAC}/{IAU_VAL_FRAC}/{IAU_TEST_FRAC} "
+            f"iau_split_seed={IAU_SPLIT_SEED}"
+        )
+    else:
+        tr_idx = np.asarray(train_idx, dtype=np.int64)
+        va_idx = np.asarray(val_idx, dtype=np.int64)
+        te_idx = np.asarray(test_idx, dtype=np.int64)
+        if split_source is None:
+            split_source = "provided_indices"
+    cfg["split_source"] = split_source
     iau = meta[IAU_COLUMN].astype(str).str.strip()
     n_iau_tr = pd.unique(iau.iloc[tr_idx]).size
     n_iau_va = pd.unique(iau.iloc[va_idx]).size
@@ -534,14 +600,18 @@ def run_one(use_redshift: bool, iter_idx: int):
     print(
         f"[split] IAU (unique): train={n_iau_tr}  val={n_iau_va}  test={n_iau_te}  |  "
         f"spectra: train={len(tr_idx)}  val={len(va_idx)}  test={len(te_idx)}  "
-        f"(fracs={IAU_TRAIN_FRAC}/{IAU_VAL_FRAC}/{IAU_TEST_FRAC} "
-        f"iau_split_seed={IAU_SPLIT_SEED} train_rng_seed={SEED})",
+        f"({split_source} train_rng_seed={seed_used})",
         flush=True,
     )
 
     tr_idx = filter_indices_mapped(meta, tr_idx, LABEL_COLUMN)
     va_idx = filter_indices_mapped(meta, va_idx, LABEL_COLUMN)
     te_idx = filter_indices_mapped(meta, te_idx, LABEL_COLUMN)
+    if min(len(tr_idx), len(va_idx), len(te_idx)) == 0:
+        raise RuntimeError(
+            f"Empty split after label filter ({split_source}): "
+            f"train={len(tr_idx)} val={len(va_idx)} test={len(te_idx)}"
+        )
 
     report_split_label_counts(meta, tr_idx, LABEL_COLUMN, "train")
     report_split_label_counts(meta, va_idx, LABEL_COLUMN, "val")
@@ -557,13 +627,21 @@ def run_one(use_redshift: bool, iter_idx: int):
     te_load = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_labeled, num_workers=0)
 
     print("[model] building encoder + head ", flush=True)
+    embed_dim = int(cfg["bottleneck_dim"]) * int(cfg["bottleneck_length"])
     model = MeanPoolClassifier(
         build_daep(cfg).to(device).encoder,
-        int(cfg["bottleneck_dim"]) * int(cfg["bottleneck_length"]),
+        embed_dim,
         n_cls,
         head_hidden=int(cfg["ff_dim"]),
-        head_dropout=float(cfg.get("dropout", 0.1)),
+        head_dropout=float(cfg["head_dropout"]),
+        n_hidden_layers=int(cfg["n_hidden_layers"]),
     ).to(device)
+    print(
+        f"[model] embed_dim={embed_dim}  hidden={int(cfg['ff_dim'])}  "
+        f"n_hidden_layers={int(cfg['n_hidden_layers'])}  "
+        f"encoder_dropout={cfg.get('dropout')}  head_dropout={cfg['head_dropout']}",
+        flush=True,
+    )
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] parameters total={n_params:,}  trainable={n_trainable:,}", flush=True)
@@ -589,9 +667,200 @@ def run_one(use_redshift: bool, iter_idx: int):
     print("[done] wrote", (out_dir / "cfg_used.json").resolve(), flush=True)
     print(f"=== run finished | USE_REDSHIFT={use_redshift} ITER={iter_idx} ===", flush=True)
 
-def main():
+def use_redshift_for_assignment_dir(latent_dir: pathlib.Path) -> bool:
+    name = latent_dir.name.lower()
+    parent = latent_dir.parent.name.lower()
+    if name.startswith("nodered") or parent.endswith("_noz"):
+        return False
+    if name.startswith("dered"):
+        return True
+    raise ValueError(
+        f"Cannot tell redshift variant from {latent_dir}. "
+        "Use a Dered* or Nodered* assignment directory."
+    )
+
+
+def map_assignment_to_flux_rows(
+    latent_dir: pathlib.Path,
+    flux_meta: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Assignment indices are rows of meta_universal.csv. Map them onto flux rows.
+
+    The deredshifted bundle matches meta_universal row for row. The no-redshift
+    bundle has a few extra spectra, so those indices are matched on spec_id.
+    """
+    from train_latent import (
+        load_assignment_indices_from_dir,
+        normalize_latent_meta,
+        resolve_latent_meta_csv,
+    )
+
+    universal = normalize_latent_meta(
+        pd.read_csv(resolve_latent_meta_csv(latent_dir), low_memory=False)
+    )
+    train_idx, val_idx, test_idx, split_source = load_assignment_indices_from_dir(
+        latent_dir,
+        universal,
+    )
+    flux = normalize_latent_meta(flux_meta)
+    if "spec_id" not in flux.columns or "spec_id" not in universal.columns:
+        if len(flux) != len(universal):
+            raise ValueError(
+                f"Flux meta has {len(flux)} rows but {latent_dir} assignment "
+                f"has {len(universal)}, and neither table has spec_id"
+            )
+        return train_idx, val_idx, test_idx, split_source
+
+    flux_ids = flux["spec_id"].astype(str).str.strip()
+    uni_ids = universal["spec_id"].astype(str).str.strip()
+    if len(flux_ids) == len(uni_ids) and flux_ids.equals(uni_ids):
+        return train_idx, val_idx, test_idx, split_source
+    if bool(flux_ids.duplicated().any()) or bool(uni_ids.duplicated().any()):
+        raise ValueError(f"Duplicate spec_id while aligning {latent_dir} to the flux meta")
+
+    pos = {sid: i for i, sid in enumerate(flux_ids)}
+    missing = [sid for sid in uni_ids if sid not in pos]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} spectra in {latent_dir} are missing from the flux meta"
+        )
+    mapper = np.fromiter((pos[sid] for sid in uni_ids), dtype=np.int64, count=len(uni_ids))
+    print(
+        f"[split] mapped {len(uni_ids)} assignment rows onto {len(flux_ids)} flux rows "
+        f"({len(flux_ids) - len(uni_ids)} flux rows unused)",
+        flush=True,
+    )
+    return mapper[train_idx], mapper[val_idx], mapper[test_idx], split_source
+
+
+def assignment_dir_for_init_run(run_dir: pathlib.Path) -> pathlib.Path:
+    """``daep_init/try_5/split_36`` -> ``wiserep_henna/try_5/Dered36_5``."""
+    run_dir = pathlib.Path(run_dir)
+    match = re.fullmatch(r"split_(\d+)", run_dir.name)
+    if match is None:
+        raise ValueError(f"Expected a split_<seed> directory, got {run_dir}")
+    seed = match.group(1)
+    try_name = run_dir.parent.name
+    noz = try_name.endswith("_noz")
+    prefix = "Nodered" if noz else "Dered"
+    ver = try_name[: -len("_noz")] if noz else try_name
+    if not ver.startswith("try_"):
+        raise ValueError(f"Cannot infer the try number from {try_name}")
+    try_num = ver.split("_", 1)[1]
+    henna_try = HENNA_ROOT / try_name
+    candidate = henna_try / f"{prefix}{seed}_{try_num}"
+    if candidate.is_dir():
+        return candidate
+    matches = sorted(henna_try.glob(f"{prefix}{seed}_*"))
+    if len(matches) == 1:
+        return matches[0]
+    raise FileNotFoundError(f"No assignment directory for {run_dir} (looked for {candidate})")
+
+
+def flux_test_indices_for_init_run(
+    run_dir: pathlib.Path,
+    flux_meta: pd.DataFrame,
+) -> tuple[np.ndarray, str]:
+    """Test-row indices into the flux table for one ``split_<seed>`` init run."""
+    from train_latent import normalize_latent_meta
+
+    latent_dir = assignment_dir_for_init_run(run_dir)
+    _, _, test_idx, split_source = map_assignment_to_flux_rows(latent_dir, flux_meta)
+    meta = normalize_latent_meta(flux_meta)
+    return filter_indices_mapped(meta, test_idx, LABEL_COLUMN), split_source
+
+
+def run_assignment_dirs(
+    latent_dirs: List[pathlib.Path],
+    *,
+    out_root: pathlib.Path,
+    train_seed: int,
+) -> None:
+    from train_latent import split_run_name, try_run_name
+
+    out_root = out_root.resolve()
+    for latent_dir in latent_dirs:
+        latent_dir = latent_dir.expanduser().resolve()
+        use_redshift = use_redshift_for_assignment_dir(latent_dir)
+        data_dir = data_dir_for(use_redshift)
+        meta_path = data_dir / "meta.csv"
+        if not meta_path.is_file():
+            meta_path = data_dir / "wiserep_metadata_processed.csv"
+        flux_meta = pd.read_csv(meta_path, low_memory=False)
+        train_idx, val_idx, test_idx, split_source = map_assignment_to_flux_rows(
+            latent_dir,
+            flux_meta,
+        )
+        out_dir = out_root / try_run_name(latent_dir) / split_run_name(latent_dir)
+        print(
+            f"=== assignment job | dir={latent_dir} out={out_dir} "
+            f"redshift={use_redshift} train_seed={train_seed} ===",
+            flush=True,
+        )
+        run_one(
+            use_redshift,
+            0,
+            data_dir=data_dir,
+            out_dir=out_dir,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            split_source=split_source,
+            train_seed=train_seed,
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train the no-diffusion DAEP classifier. "
+            "Encoder and MLP match the diffusion latent models."
+        )
+    )
+    parser.add_argument(
+        "--latent-dirs",
+        nargs="+",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Assignment directories (each with split_assignment*.json), "
+            "e.g. data/wiserep_henna/try_5/Dered36_5. "
+            "One model per directory, on that directory's train/val/test rows. "
+            "Flux is deredshifted/ or noderedshift/."
+        ),
+    )
+    parser.add_argument(
+        "--out-root",
+        type=pathlib.Path,
+        default=DEFAULT_INIT_OUT_ROOT,
+        help=(
+            f"Parent output directory for --latent-dirs "
+            f"(default: {DEFAULT_INIT_OUT_ROOT}). "
+            "Each job writes <out-root>/<try_N>/split_<seed>/."
+        ),
+    )
+    parser.add_argument(
+        "--train-seed",
+        type=int,
+        default=SEED,
+        help=f"Training RNG seed for --latent-dirs (default: {SEED}).",
+    )
+    args = parser.parse_args()
+
+    if args.latent_dirs is not None:
+        run_assignment_dirs(
+            args.latent_dirs,
+            out_root=args.out_root,
+            train_seed=args.train_seed,
+        )
+        return
+
     for use_redshift in USE_REDSHIFT_VALUES:
         for iter_idx in ITER_VALUES:
+            out = out_dir_for(use_redshift, iter_idx)
+            if (out / "classifier_best.pt").is_file():
+                print(f"[skip] {out} already has classifier_best.pt", flush=True)
+                continue
             run_one(use_redshift, iter_idx)
 
 if __name__ == "__main__":
